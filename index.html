@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D Box Viewer</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; overflow: hidden; background: #1a1a2e; }
+    #container { width: 100%; height: 100%; cursor: grab; background: rgb(7, 43, 69); }
+    #container:active { cursor: grabbing; }
+    /* Prevent browser touch gestures (page zoom/pan) so OrbitControls gets them */
+    #container canvas { touch-action: none; }
+    #info {
+        position: absolute;
+        bottom: 20px;
+        left: 50%;
+        transform: translateX(-50%);
+        color: rgba(255,255,255,0.6);
+        font-family: Arial, sans-serif;
+        font-size: 14px;
+        user-select: none;
+        pointer-events: none;
+        text-align: center;
+    }
+    #loading {
+        position: absolute;
+        top: 50%;
+        left: 50%;
+        transform: translate(-50%, -50%);
+        color: white;
+        font-family: Arial, sans-serif;
+        font-size: 18px;
+    }
+</style>
+</head>
+<body>
+<div id="container"></div>
+<div id="loading">Loading textures…</div>
+<div id="info">Drag to rotate &nbsp;•&nbsp; Scroll to zoom &nbsp;•&nbsp; Right-drag to pan</div>
+
+<script type="importmap">
+{
+    "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+    }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoundedBoxGeometry } from 'three/addons/geometries/RoundedBoxGeometry.js';
+
+// Box dimensions from the actual texture pixel proportions
+const W = 5300, H = 7520, D = 1440;
+const SCALE = 1 / 1000; // scale down to reasonable scene units
+
+// Scene setup
+// Background color is read from the DOM: #container's CSS background-color
+const scene = new THREE.Scene();
+const container = document.getElementById('container');
+scene.background = new THREE.Color(getComputedStyle(container).backgroundColor);
+
+const camera = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+
+// Initial view: the camera distance is computed so the whole box always
+// fits into the viewport (with margin). The viewing DIRECTION is set via
+// the two angles below.
+const VIEW_MARGIN = 1.15;      // 1.0 = box touches viewport edges, higher = more air
+const VIEW_AZIMUTH = 35;       // horizontal angle in degrees (0 = front, 90 = right side)
+const VIEW_ELEVATION = 0;     // vertical angle in degrees (0 = side view, 90 = top view)
+
+const boxDiag = Math.sqrt((W * SCALE) ** 2 + (H * SCALE) ** 2 + (D * SCALE) ** 2);
+const fitDist = (boxDiag / 2 * VIEW_MARGIN) / Math.tan(THREE.MathUtils.degToRad(camera.fov / 2));
+const az = THREE.MathUtils.degToRad(VIEW_AZIMUTH);
+const el = THREE.MathUtils.degToRad(VIEW_ELEVATION);
+camera.position.set(
+    fitDist * Math.cos(el) * Math.sin(az),
+    fitDist * Math.sin(el),
+    fitDist * Math.cos(el) * Math.cos(az)
+);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2)); // cap DPR to save GPU memory
+container.appendChild(renderer.domElement);
+
+// If the GPU context is lost (e.g. memory pressure), reload cleanly
+renderer.domElement.addEventListener('webglcontextlost', (e) => {
+    e.preventDefault();
+    location.reload();
+});
+
+// Lighting
+const ambientLight = new THREE.AmbientLight(0xffffff, 0.7);
+scene.add(ambientLight);
+
+const dirLight1 = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight1.position.set(5, 8, 6);
+scene.add(dirLight1);
+
+const dirLight2 = new THREE.DirectionalLight(0xffffff, 0.5);
+dirLight2.position.set(-5, -3, -6);
+scene.add(dirLight2);
+
+// Controls
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.08;
+controls.minDistance = 3;
+controls.maxDistance = 30;
+controls.autoRotate = true;          // gentle auto-rotation until user interacts
+controls.autoRotateSpeed = 1.5;
+
+// Re-enable auto-rotation after 10s without user interaction
+const IDLE_RESUME_MS = 10000;
+let idleTimer = null;
+controls.addEventListener('start', () => {
+    controls.autoRotate = false;
+    clearTimeout(idleTimer);
+});
+controls.addEventListener('end', () => {
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => { controls.autoRotate = true; }, IDLE_RESUME_MS);
+});
+
+// Touch gestures (explicit, though these are the OrbitControls defaults):
+//   1 finger  = rotate
+//   2 fingers = pinch dolly (zoom) + parallel-move pan
+controls.touches = { ONE: THREE.TOUCH.ROTATE, TWO: THREE.TOUCH.DOLLY_PAN };
+
+// --- Cardboard helpers -------------------------------------------------
+
+// Draws the photo onto a canvas and extends the artwork's own edge colors
+// outward as a border (edge-stretch), slightly darkened for a folded-edge
+// look — no foreign (brown) color, the box art shimmers through.
+// Images are downscaled to MAX_TEX_SIZE to stay within GPU memory limits.
+// Set MAX_TEX_SIZE = 0 to disable downscaling (use source resolution as-is).
+const MAX_TEX_SIZE = 0;
+
+// Border appearance — tweak these to taste:
+const BORDER_PX = 0;           // border thickness in texture pixels
+const BORDER_DARKEN = 0.82;     // 1 = same brightness as artwork, lower = darker fold
+const SEAM_COLOR = 'rgba(200,200,200,0.5)';  // fold seam line color
+const SEAM_WIDTH = 1;          // fold seam line width in pixels
+const CORNER_RADIUS = 0.04;    // corner rounding in scene units (0 = sharp)
+const CORNER_SEGMENTS = 4;     // smoothness of the corner rounding
+
+function makeCardboardFaceTexture(image, borderPx = BORDER_PX) {
+    // downscale while keeping aspect ratio (0 = keep source resolution)
+    const scale = MAX_TEX_SIZE > 0 ? Math.min(1, MAX_TEX_SIZE / Math.max(image.width, image.height)) : 1;
+    const w = Math.round(image.width * scale);
+    const h = Math.round(image.height * scale);
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+
+    // 1. draw the artwork (downscaled)
+    ctx.drawImage(image, 0, 0, w, h);
+
+    // 2. extend the artwork's own edge pixels into the border zone.
+    //    We copy 1px-wide strips from just inside the artwork edge and
+    //    stretch them over the border area — the box color "wraps around".
+    // top edge (stretch row at y=borderPx upward)
+    ctx.drawImage(canvas, 0, borderPx, w, 1, 0, 0, w, borderPx);
+    // bottom edge
+    ctx.drawImage(canvas, 0, h - borderPx - 1, w, 1, 0, h - borderPx, w, borderPx);
+    // left edge
+    ctx.drawImage(canvas, borderPx, 0, 1, h, 0, 0, borderPx, h);
+    // right edge
+    ctx.drawImage(canvas, w - borderPx - 1, 0, 1, h, w - borderPx, 0, borderPx, h);
+
+    // 3. darken the border slightly so the edge reads as a fold
+    const imgData = ctx.getImageData(0, 0, w, h);
+    const d = imgData.data;
+    for (let y = 0; y < h; y++) {
+        for (let x = 0; x < w; x++) {
+            const onBorder = x < borderPx || x >= w - borderPx || y < borderPx || y >= h - borderPx;
+            if (!onBorder) continue;
+            const i = (y * w + x) * 4;
+            d[i]     *= BORDER_DARKEN;
+            d[i + 1] *= BORDER_DARKEN;
+            d[i + 2] *= BORDER_DARKEN;
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+
+    // 4. subtle dark seam line where artwork meets border (fold shadow)
+    ctx.strokeStyle = SEAM_COLOR;
+    ctx.lineWidth = SEAM_WIDTH;
+    ctx.strokeRect(borderPx, borderPx, w - 2 * borderPx, h - 2 * borderPx);
+
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.colorSpace = THREE.SRGBColorSpace;
+    tex.anisotropy = renderer.capabilities.getMaxAnisotropy();
+    return tex;
+}
+
+// Procedural paper-fiber bump map (grayscale noise, tileable enough)
+function makeFiberBumpTexture(size = 512) {
+    const canvas = document.createElement('canvas');
+    canvas.width = canvas.height = size;
+    const ctx = canvas.getContext('2d');
+    const imgData = ctx.createImageData(size, size);
+    const d = imgData.data;
+    for (let i = 0; i < d.length; i += 4) {
+        const v = 128 + (Math.random() - 0.5) * 60;
+        d[i] = d[i + 1] = d[i + 2] = v;
+        d[i + 3] = 255;
+    }
+    ctx.putImageData(imgData, 0, 0);
+    // soften with a few blurred strokes to imitate fiber strands
+    ctx.globalAlpha = 0.08;
+    for (let i = 0; i < 400; i++) {
+        ctx.strokeStyle = Math.random() > 0.5 ? '#fff' : '#000';
+        ctx.lineWidth = 1;
+        ctx.beginPath();
+        const x = Math.random() * size, y = Math.random() * size;
+        ctx.moveTo(x, y);
+        ctx.lineTo(x + (Math.random() - 0.5) * 30, y + (Math.random() - 0.5) * 30);
+        ctx.stroke();
+    }
+    const tex = new THREE.CanvasTexture(canvas);
+    tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+    tex.repeat.set(4, 4);
+    return tex;
+}
+
+// Load image element (needed for canvas compositing)
+const loadImage = (file) => new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = file;
+});
+
+// Load images sequentially to avoid decoding all huge PNGs into memory at once
+const faceFiles = [
+    'boxshot-right.webp',   // +X
+    'boxshot-left.webp',    // -X
+    'boxshot-top.webp',     // +Y
+    'boxshot-bottom.webp',  // -Y
+    'boxshot-front.webp',   // +Z
+    'boxshot-back.webp'     // -Z
+];
+
+(async () => {
+    const images = [];
+    for (const f of faceFiles) images.push(await loadImage(f));
+    const [rightImg, leftImg, topImg, bottomImg, frontImg, backImg] = images;
+    // Build cardboard-edged face textures
+    const right  = makeCardboardFaceTexture(rightImg);
+    const left   = makeCardboardFaceTexture(leftImg);
+    const top    = makeCardboardFaceTexture(topImg);
+    const bottom = makeCardboardFaceTexture(bottomImg);
+    const front  = makeCardboardFaceTexture(frontImg);
+    const back   = makeCardboardFaceTexture(backImg);
+
+    // Fix orientations so the artwork appears upright
+    bottom.rotation = Math.PI;
+    bottom.center.set(0.5, 0.5);
+
+    // Shared paper-fiber bump map
+    const fiberBump = makeFiberBumpTexture();
+
+    const materials = [right, left, top, bottom, front, back].map(
+        (tex) => new THREE.MeshStandardMaterial({
+            map: tex,
+            roughness: 0.85,
+            metalness: 0.0,
+            bumpMap: fiberBump,
+            bumpScale: 0.02
+        })
+    );
+
+    // Rounded corners like a real folded carton
+    const geometry = new RoundedBoxGeometry(W * SCALE, H * SCALE, D * SCALE, CORNER_SEGMENTS, CORNER_RADIUS);
+    const box = new THREE.Mesh(geometry, materials);
+    scene.add(box);
+
+    document.getElementById('loading').style.display = 'none';
+})().catch((err) => {
+    document.getElementById('loading').textContent = 'Failed to load textures: ' + err;
+});
+
+// Animation loop
+function animate() {
+    requestAnimationFrame(animate);
+    controls.update();
+    renderer.render(scene, camera);
+}
+animate();
+
+// Handle window resize
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+</script>
+</body>
+</html>
